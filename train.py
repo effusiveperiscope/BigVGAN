@@ -28,12 +28,15 @@ import torchaudio as ta
 from pesq import pesq
 from tqdm import tqdm
 import auraloss
+from accelerate import Accelerator
 
 torch.backends.cudnn.benchmark = False
 
+accelerator = Accelerator()
+
 def train(rank, a, h):
     if h.num_gpus > 1:
-        # initialize distributed
+        # initialize distribute
         init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
                            world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
 
@@ -43,15 +46,18 @@ def train(rank, a, h):
     device = torch.device('cuda:{:d}'.format(rank))
 
     # define BigVGAN generator
-    generator = BigVGAN(h).to(device)
+    generator = BigVGAN(h)
+    generator = accelerator.prepare(generator)
     print("Generator params: {}".format(sum(p.numel() for p in generator.parameters())))
 
     # define discriminators. MPD is used by default
-    mpd = MultiPeriodDiscriminator(h).to(device)
+    mpd = MultiPeriodDiscriminator(h)
+    mpd = accelerator.prepare(mpd)
     print("Discriminator mpd params: {}".format(sum(p.numel() for p in mpd.parameters())))
 
     # define additional discriminators. BigVGAN uses MRD as default
-    mrd = MultiResolutionDiscriminator(h).to(device)
+    mrd = MultiResolutionDiscriminator(h)
+    mrd = accelerator.prepare(mrd)
     print("Discriminator mrd params: {}".format(sum(p.numel() for p in mrd.parameters())))
 
     # create or scan the latest checkpoint from checkpoints directory
@@ -79,14 +85,14 @@ def train(rank, a, h):
         last_epoch = state_dict_do['epoch']
 
     # initialize DDP, optimizers, and schedulers
-    if h.num_gpus > 1:
-        generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
-        mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
-        mrd = DistributedDataParallel(mrd, device_ids=[rank]).to(device)
+    #if h.num_gpus > 1:
+    #    generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
+    #    mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
+    #    mrd = DistributedDataParallel(mrd, device_ids=[rank]).to(device)
 
-    optim_g = torch.optim.AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+    optim_g = torch.optim.AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2], eps=1e-7)
     optim_d = torch.optim.AdamW(itertools.chain(mrd.parameters(), mpd.parameters()),
-                                h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+                                h.learning_rate, betas=[h.adam_b1, h.adam_b2], eps=1e-7)
 
     if state_dict_do is not None:
         optim_g.load_state_dict(state_dict_do['optim_g'])
@@ -94,6 +100,9 @@ def train(rank, a, h):
 
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
+
+    optim_g, optim_d, scheduler_g, scheduler_d = accelerator.prepare(
+        optim_g, optim_d, scheduler_g, scheduler_d)
 
     # define training and validation datasets
     # unseen_validation_filelist will contain sample filepaths outside the seen training & validation dataset
@@ -104,6 +113,7 @@ def train(rank, a, h):
                           h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
                           shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
                           fine_tuning=a.fine_tuning, base_mels_path=a.input_mels_dir, is_seen=True)
+    trainset.name = h.dataset_name
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
 
@@ -112,6 +122,7 @@ def train(rank, a, h):
                               batch_size=h.batch_size,
                               pin_memory=True,
                               drop_last=True)
+    train_loader = accelerator.prepare(train_loader)
 
     if rank == 0:
         validset = MelDataset(validation_filelist, h, h.segment_size, h.n_fft, h.num_mels,
@@ -123,6 +134,7 @@ def train(rank, a, h):
                                        batch_size=1,
                                        pin_memory=True,
                                        drop_last=True)
+        validation_loader = accelerator.prepare(validation_loader)
 
         list_unseen_validset = []
         list_unseen_validation_loader = []
@@ -136,6 +148,7 @@ def train(rank, a, h):
                                                   batch_size=1,
                                                   pin_memory=True,
                                                   drop_last=True)
+            unseen_validation_loader = accelerator.prepare(unseen_validation_loader)
             list_unseen_validset.append(unseen_validset)
             list_unseen_validation_loader.append(unseen_validation_loader)
 
@@ -170,28 +183,30 @@ def train(rank, a, h):
             # loop over validation set and compute metrics
             for j, batch in tqdm(enumerate(loader)):
                 x, y, _, y_mel = batch
-                y = y.to(device)
+                y = accelerator.prepare(y)
+                x = accelerator.prepare(x)
                 if hasattr(generator, 'module'):
-                    y_g_hat = generator.module(x.to(device))
+                    y_g_hat = generator.module(x)
                 else:
-                    y_g_hat = generator(x.to(device))
-                y_mel = y_mel.to(device, non_blocking=True)
+                    y_g_hat = generator(x)
+                y_mel = accelerator.prepare(y_mel)
                 y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
                                               h.hop_size, h.win_size,
                                               h.fmin, h.fmax_for_loss)
                 val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
                 # PESQ calculation. only evaluate PESQ if it's speech signal (nonspeech PESQ will error out)
-                if not "nonspeech" in mode: # skips if the name of dataset (in mode string) contains "nonspeech"
-                    # resample to 16000 for pesq
-                    y_16k = pesq_resampler(y)
-                    y_g_hat_16k = pesq_resampler(y_g_hat.squeeze(1))
-                    y_int_16k = (y_16k[0] * MAX_WAV_VALUE).short().cpu().numpy()
-                    y_g_hat_int_16k = (y_g_hat_16k[0] * MAX_WAV_VALUE).short().cpu().numpy()
-                    val_pesq_tot += pesq(16000, y_int_16k, y_g_hat_int_16k, 'wb')
+                # This fails in early training so I'm disabling it
+                #if not "nonspeech" in mode: # skips if the name of dataset (in mode string) contains "nonspeech"
+                #    # resample to 16000 for pesq
+                #    y_16k = pesq_resampler(y)
+                #    y_g_hat_16k = pesq_resampler(y_g_hat.squeeze(1))
+                #    y_int_16k = (y_16k[0] * MAX_WAV_VALUE).short().cpu().numpy()
+                #    y_g_hat_int_16k = (y_g_hat_16k[0] * MAX_WAV_VALUE).short().cpu().numpy()
+                #    val_pesq_tot += pesq(16000, y_int_16k, y_g_hat_int_16k, 'wb')
 
                 # MRSTFT calculation
-                val_mrstft_tot += loss_mrstft(y_g_hat.squeeze(1), y).item()
+                val_mrstft_tot += loss_mrstft(y_g_hat, y).item()
 
                 # log audio and figures to Tensorboard
                 if j % a.eval_subsample == 0:  # subsample every nth from validation set
@@ -199,7 +214,7 @@ def train(rank, a, h):
                         sw.add_audio('gt_{}/y_{}'.format(mode, j), y[0], steps, h.sampling_rate)
                         if a.save_audio: # also save audio to disk if --save_audio is set to True
                             save_audio(y[0], os.path.join(a.checkpoint_path, 'samples', 'gt_{}'.format(mode), '{:04d}.wav'.format(j)), h.sampling_rate)
-                        sw.add_figure('gt_{}/y_spec_{}'.format(mode, j), plot_spectrogram(x[0]), steps)
+                        sw.add_figure('gt_{}/y_spec_{}'.format(mode, j), plot_spectrogram(x[0].cpu().numpy()), steps)
 
                     sw.add_audio('generated_{}/y_hat_{}'.format(mode, j), y_g_hat[0], steps, h.sampling_rate)
                     if a.save_audio: # also save audio to disk if --save_audio is set to True
@@ -212,7 +227,7 @@ def train(rank, a, h):
                                   plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
                     # visualization of spectrogram difference between GT and synthesized audio
                     # difference higher than 1 is clipped for better visualization
-                    spec_delta = torch.clamp(torch.abs(x[0] - y_hat_spec.squeeze(0).cpu()), min=1e-6, max=1.)
+                    spec_delta = torch.clamp(torch.abs(x[0].cpu() - y_hat_spec.squeeze(0).cpu()), min=1e-6, max=1.)
                     sw.add_figure('delta_dclip1_{}/spec_{}'.format(mode, j),
                                   plot_spectrogram_clipped(spec_delta.numpy(), clip_max=1.), steps)
 
@@ -255,9 +270,7 @@ def train(rank, a, h):
                 start_b = time.time()
             x, y, _, y_mel = batch
 
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            y_mel = y_mel.to(device, non_blocking=True)
+            x, y, y_mel = accelerator.prepare(x, y, y_mel)
             y = y.unsqueeze(1)
 
             y_g_hat = generator(x)
@@ -278,7 +291,7 @@ def train(rank, a, h):
 
             # whether to freeze D for initial training steps
             if steps >= a.freeze_step:
-                loss_disc_all.backward()
+                accelerator.backward(loss_disc_all)
                 grad_norm_mpd = torch.nn.utils.clip_grad_norm_(mpd.parameters(), 1000.)
                 grad_norm_mrd = torch.nn.utils.clip_grad_norm_(mrd.parameters(), 1000.)
                 optim_d.step()
@@ -309,7 +322,10 @@ def train(rank, a, h):
                 print("WARNING: using regression loss only for G for the first {} steps".format(a.freeze_step))
                 loss_gen_all = loss_mel
 
-            loss_gen_all.backward()
+            if loss_gen_all.isnan().any().item():
+                import pdb
+                pdb.set_trace()
+            accelerator.backward(loss_gen_all)
             grad_norm_g = torch.nn.utils.clip_grad_norm_(generator.parameters(), 1000.)
             optim_g.step()
 
@@ -375,6 +391,7 @@ def train(rank, a, h):
         if rank == 0:
             print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
 
+os.makedirs
 
 def main():
     print('Initializing Training Process..')
@@ -396,9 +413,9 @@ def main():
 
     parser.add_argument('--training_epochs', default=100000, type=int)
     parser.add_argument('--stdout_interval', default=5, type=int)
-    parser.add_argument('--checkpoint_interval', default=50000, type=int)
+    parser.add_argument('--checkpoint_interval', default=8000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
-    parser.add_argument('--validation_interval', default=50000, type=int)
+    parser.add_argument('--validation_interval', default=8000, type=int)
 
     parser.add_argument('--freeze_step', default=0, type=int,
                         help='freeze D for the first specified steps. G only uses regression loss for these steps.')
@@ -413,7 +430,7 @@ def main():
                         help="subsampling during evaluation loop")
     parser.add_argument('--skip_seen', default=False, type=bool,
                         help="skip seen dataset. useful for test set inference")
-    parser.add_argument('--save_audio', default=False, type=bool,
+    parser.add_argument('--save_audio', default=True, type=bool,
                         help="save audio of test set inference to disk")
 
     a = parser.parse_args()
