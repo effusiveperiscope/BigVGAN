@@ -20,7 +20,7 @@ Copy requirements.txt /root/BigVGAN/
 Run pip3 install --upgrade pip
 Run pip3 install numpy==1.23.5 librosa==0.10.1 \
     scipy==1.11.3 tensorboard==2.15.1 soundfile==0.12.1 matplotlib==3.8.1 \
-    pesq==0.0.4 auraloss==0.4.0 tqdm==4.66.1
+    pesq==0.0.4 auraloss==0.4.0 tqdm==4.66.1 accelerate==0.25.0
 
 Run ldconfig && \
 apt-get clean && \
