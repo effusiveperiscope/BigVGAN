@@ -150,7 +150,8 @@ def get_dataset_filelist(a):
 
     with open(a.input_training_file, "r", encoding="utf-8") as fi:
         training_files = [
-            os.path.join(a.input_wavs_dir, x.split("|")[0] + ".wav")
+            #os.path.join(a.input_wavs_dir, x.split("|")[0] + ".wav")
+            x
             for x in fi.read().split("\n")
             if len(x) > 0
         ]
@@ -158,7 +159,8 @@ def get_dataset_filelist(a):
 
     with open(a.input_validation_file, "r", encoding="utf-8") as fi:
         validation_files = [
-            os.path.join(a.input_wavs_dir, x.split("|")[0] + ".wav")
+            #os.path.join(a.input_wavs_dir, x.split("|")[0] + ".wav")
+            x
             for x in fi.read().split("\n")
             if len(x) > 0
         ]
@@ -167,7 +169,8 @@ def get_dataset_filelist(a):
     for i in range(len(a.list_input_unseen_validation_file)):
         with open(a.list_input_unseen_validation_file[i], "r", encoding="utf-8") as fi:
             unseen_validation_files = [
-                os.path.join(a.list_input_unseen_wavs_dir[i], x.split("|")[0] + ".wav")
+                #os.path.join(a.list_input_unseen_wavs_dir[i], x.split("|")[0] + ".wav")
+                x
                 for x in fi.read().split("\n")
                 if len(x) > 0
             ]
